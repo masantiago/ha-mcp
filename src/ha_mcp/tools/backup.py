@@ -115,38 +115,24 @@ async def _get_local_backup_agent_id(
 
 async def _get_backup_password(
     ws_client: HomeAssistantWebSocketClient,
-) -> str:
+) -> str | None:
     """
     Retrieve default backup password from Home Assistant configuration.
 
-    Args:
-        ws_client: Connected WebSocket client
-
-    Returns:
-        The backup password string.
-
-    Raises:
-        ToolError: If backup config cannot be retrieved or no password is configured.
+    Returns the password if configured, or ``None`` when HA has no default
+    backup password set. Callers should omit the ``password`` field from
+    backup/restore commands when this returns ``None`` so the operation
+    proceeds with an unencrypted backup.
     """
     backup_config = await ws_client.send_command("backup/config/info")
     if not backup_config.get("success"):
-        raise_tool_error(create_error_response(
-            ErrorCode.SERVICE_CALL_FAILED,
-            "Failed to retrieve backup configuration",
-            context={"details": backup_config},
-        ))
+        logger.warning(
+            "Failed to retrieve backup configuration — proceeding without password"
+        )
+        return None
 
     config_data = backup_config.get("result", {}).get("config", {})
-    default_password = config_data.get("create_backup", {}).get("password")
-
-    if not default_password:
-        raise_tool_error(create_error_response(
-            ErrorCode.SERVICE_CALL_FAILED,
-            "No default backup password configured in Home Assistant",
-            suggestions=["Configure automatic backups in Home Assistant settings to set a default password"],
-        ))
-
-    return cast(str, default_password)
+    return config_data.get("create_backup", {}).get("password") or None
 
 
 async def _poll_backup_completion(
@@ -255,7 +241,7 @@ async def create_backup(
             ))
         ws_client = cast(HomeAssistantWebSocketClient, ws_client)
 
-        # Get backup password (raises ToolError on failure)
+        # Get backup password (None when HA has no default password configured)
         password = await _get_backup_password(ws_client)
 
         # Discover the local backup agent at call time. HA Core registers
@@ -276,14 +262,15 @@ async def create_backup(
             f"Detected {'Supervised' if is_supervised else 'Core'} install "
             f"via backup agent '{local_agent}'"
         )
-        backup_params = {
+        backup_params: dict[str, Any] = {
             "name": name,
-            "password": password,
             "agent_ids": [local_agent],
             "include_homeassistant": True,
             "include_database": False,  # Fast backup
             "include_all_addons": is_supervised,
         }
+        if password is not None:
+            backup_params["password"] = password
 
         # Send backup request
         result = await ws_client.send_command("backup/generate", **backup_params)
@@ -324,35 +311,98 @@ async def create_backup(
                 pass  # Ignore errors during cleanup
 
 
+async def _wait_for_backup_idle(
+    ws_client: HomeAssistantWebSocketClient,
+    context: dict[str, Any],
+    max_wait_seconds: int = _BACKUP_MAX_WAIT_S,
+    poll_interval: int = _BACKUP_POLL_INTERVAL_S,
+) -> None:
+    """Block until the backup manager returns to idle+completed state.
+
+    Used by the restore flow to ensure the safety backup is fully written
+    before issuing ``backup/restore`` — otherwise HA can start the restore
+    while the safety backup is still being serialized, defeating its purpose.
+    """
+    waited = 0
+    while waited < max_wait_seconds:
+        await asyncio.sleep(poll_interval)
+        waited += poll_interval
+
+        info_result = await ws_client.send_command("backup/info")
+        if not info_result.get("success"):
+            continue
+
+        state = info_result.get("result", {}).get("state")
+        event_state = (
+            info_result.get("result", {}).get("last_action_event", {}).get("state")
+        )
+        logger.debug(
+            "Backup state: %s, event_state: %s, waited: %ds", state, event_state, waited
+        )
+
+        if state == "idle" and event_state == "completed":
+            return
+
+        if event_state == "failed":
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.SERVICE_CALL_FAILED,
+                    "Backup operation failed",
+                    context=context,
+                )
+            )
+
+    raise_tool_error(
+        create_error_response(
+            ErrorCode.TIMEOUT_OPERATION,
+            f"Backup operation timed out after {max_wait_seconds} seconds",
+            context=context,
+            suggestions=[
+                "Backup may still be in progress. Check Home Assistant backup status."
+            ],
+        )
+    )
+
+
 async def _create_safety_backup(
     ws_client: HomeAssistantWebSocketClient,
     password: str | None,
     agent_id: str,
-) -> str | None:
-    """Create a pre-restore safety backup.
+) -> str:
+    """Create a pre-restore safety backup and wait for it to finish.
 
     ``agent_id`` is the local backup agent (Supervisor's ``hassio.local`` or
-    Core's ``backup.local``) discovered by the caller.
+    Core's ``backup.local``) discovered by the caller. ``password`` is the
+    default HA backup password if configured; when ``None`` the safety
+    backup is created without encryption rather than skipped — a destructive
+    restore must always have a rollback artifact.
 
-    Returns the safety backup ID, or None when password is None (backup intentionally
-    skipped). Raises ToolError if backup creation fails.
+    The function returns only after HA reports the backup manager back to
+    idle+completed, so the caller can issue ``backup/restore`` knowing the
+    safety backup is fully written. Raises ToolError on backup failure or
+    timeout.
+
+    ``include_database`` is set to False to keep the safety backup fast;
+    callers willing to trade speed for rollback fidelity (historical DB
+    included) should adjust this at the call site.
     """
-    if password is None:
-        return None
-
     now = datetime.now()
     safety_backup_name = f"PreRestore_Safety_{now.strftime('%Y-%m-%d_%H:%M:%S')}"
 
     # include_all_addons is a Supervisor concept; HA Core rejects it.
     is_supervised = agent_id == "hassio.local"
+    safety_backup_params: dict[str, Any] = {
+        "name": safety_backup_name,
+        "agent_ids": [agent_id],
+        "include_homeassistant": True,
+        "include_database": False,
+        "include_all_addons": is_supervised,
+    }
+    if password is not None:
+        safety_backup_params["password"] = password
+
     safety_backup = await ws_client.send_command(
-        "backup/generate",
-        name=safety_backup_name,
-        password=password,
-        agent_ids=[agent_id],
-        include_homeassistant=True,
-        include_database=True,
-        include_all_addons=is_supervised,
+        "backup/generate", **safety_backup_params
     )
 
     if not safety_backup.get("success"):
@@ -363,12 +413,21 @@ async def _create_safety_backup(
         ))
 
     safety_backup_id = safety_backup.get("result", {}).get("backup_job_id")
-    logger.info(f"Safety backup created: {safety_backup_id}")
+    logger.info(
+        "Safety backup job started: %s, waiting for completion before restore...",
+        safety_backup_id,
+    )
+    await _wait_for_backup_idle(
+        ws_client, context={"safety_backup_job_id": safety_backup_id}
+    )
+    logger.info("Safety backup completed: %s", safety_backup_id)
     return cast(str, safety_backup_id)
 
 
 async def restore_backup(
-    client: HomeAssistantClient, backup_id: str, restore_database: bool = False
+    client: HomeAssistantClient,
+    backup_id: str | None = None,
+    restore_database: bool = False,
 ) -> dict[str, Any]:
     """
     Restore Home Assistant from a backup (DESTRUCTIVE - use with caution).
@@ -377,7 +436,8 @@ async def restore_backup(
 
     Args:
         client: Home Assistant REST client
-        backup_id: Backup ID to restore
+        backup_id: Backup ID to restore. If ``None``, the most recent backup
+            available is selected.
         restore_database: Whether to restore database (historical data)
 
     Returns:
@@ -397,7 +457,7 @@ async def restore_backup(
             ))
         ws_client = cast(HomeAssistantWebSocketClient, ws_client)
 
-        # Verify backup exists
+        # Fetch available backups
         backup_info = await ws_client.send_command("backup/info")
         if not backup_info.get("success"):
             raise_tool_error(create_error_response(
@@ -406,33 +466,44 @@ async def restore_backup(
             ))
 
         backups = backup_info.get("result", {}).get("backups", [])
-        backup_exists = any(b.get("backup_id") == backup_id for b in backups)
 
-        if not backup_exists:
-            raise_tool_error(create_error_response(
-                ErrorCode.RESOURCE_NOT_FOUND,
-                f"Backup '{backup_id}' not found",
-                suggestions=["Use ha_backup_list() to see available backups"],
-            ))
+        if backup_id is None:
+            if not backups:
+                raise_tool_error(create_error_response(
+                    ErrorCode.RESOURCE_NOT_FOUND,
+                    "No backups available to restore",
+                ))
+            latest = max(backups, key=lambda b: b.get("date", ""))
+            backup_id = latest.get("backup_id")
+            logger.info(
+                "No backup_id specified — restoring most recent backup: %s",
+                backup_id,
+            )
+        else:
+            backup_exists = any(b.get("backup_id") == backup_id for b in backups)
+            if not backup_exists:
+                raise_tool_error(create_error_response(
+                    ErrorCode.RESOURCE_NOT_FOUND,
+                    f"Backup '{backup_id}' not found",
+                    suggestions=[
+                        "Use ha_backup_list() to see available backups, or omit "
+                        "backup_id to restore the most recent one",
+                    ],
+                ))
 
         # Discover the local backup agent (Supervisor's hassio.local on
         # Supervised, backup.local on Core). Used for both the safety backup
         # and the restore call below.
         local_agent = await _get_local_backup_agent_id(ws_client)
 
-        # Create safety backup BEFORE restoring
+        # Create safety backup BEFORE restoring (and wait for it to finish
+        # before issuing the destructive restore call).
         logger.info("Creating safety backup before restore...")
-        try:
-            password = await _get_backup_password(ws_client)
-        except ToolError:
-            # Password error - log warning but continue (restore might still work)
-            logger.warning("No default password - proceeding without safety backup")
-            password = None
-
+        password = await _get_backup_password(ws_client)
         safety_backup_id = await _create_safety_backup(ws_client, password, local_agent)
 
         # Perform restore
-        restore_params = {
+        restore_params: dict[str, Any] = {
             "backup_id": backup_id,
             "agent_id": local_agent,
             "restore_database": restore_database,
@@ -440,6 +511,8 @@ async def restore_backup(
             "restore_addons": [],  # Restore all addons from backup
             "restore_folders": [],  # Restore all folders from backup
         }
+        if password is not None:
+            restore_params["password"] = password
 
         result = await ws_client.send_command("backup/restore", **restore_params)
 
@@ -531,11 +604,12 @@ def register_backup_tools(mcp: "FastMCP", client: HomeAssistantClient, **kwargs:
     @log_tool_usage
     async def ha_backup_restore(
         backup_id: Annotated[
-            str,
+            str | None,
             Field(
-                description="Backup ID to restore (e.g., 'dd7550ed' from backup list or ha_backup_create result)"
+                description="Backup ID to restore (e.g., 'dd7550ed'). Omit to restore the most recent backup.",
+                default=None,
             ),
-        ],
+        ] = None,
         restore_database: Annotated[
             bool,
             Field(
@@ -578,7 +652,8 @@ def register_backup_tools(mcp: "FastMCP", client: HomeAssistantClient, **kwargs:
         4. Expect a restart and temporary downtime
 
         **Example Usage:**
-        - Restore config only: ha_backup_restore("dd7550ed")
+        - Restore most recent backup: ha_backup_restore()
+        - Restore specific backup, config only: ha_backup_restore("dd7550ed")
         - Full restore with DB: ha_backup_restore("dd7550ed", restore_database=true)
 
         **Returns:** Restore job status
