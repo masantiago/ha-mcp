@@ -432,8 +432,6 @@ async def restore_backup(
     """
     Restore Home Assistant from a backup (DESTRUCTIVE - use with caution).
 
-    Creates a safety backup before restore to allow rollback if needed.
-
     Args:
         client: Home Assistant REST client
         backup_id: Backup ID to restore. If ``None``, the most recent backup
@@ -441,7 +439,7 @@ async def restore_backup(
         restore_database: Whether to restore database (historical data)
 
     Returns:
-        Dictionary with restore result including safety_backup_id, status, etc.
+        Dictionary with restore result including backup_id, status, etc.
     """
     ws_client = None
 
@@ -492,15 +490,10 @@ async def restore_backup(
                 ))
 
         # Discover the local backup agent (Supervisor's hassio.local on
-        # Supervised, backup.local on Core). Used for both the safety backup
-        # and the restore call below.
+        # Supervised, backup.local on Core).
         local_agent = await _get_local_backup_agent_id(ws_client)
 
-        # Create safety backup BEFORE restoring (and wait for it to finish
-        # before issuing the destructive restore call).
-        logger.info("Creating safety backup before restore...")
         password = await _get_backup_password(ws_client)
-        safety_backup_id = await _create_safety_backup(ws_client, password, local_agent)
 
         # Perform restore
         restore_params: dict[str, Any] = {
@@ -521,10 +514,8 @@ async def restore_backup(
                 "success": True,
                 "backup_id": backup_id,
                 "status": "Restore initiated - Home Assistant will restart",
-                "safety_backup_id": safety_backup_id,
                 "restore_database": restore_database,
                 "warning": "Home Assistant is restarting. Connection will be temporarily lost.",
-                "note": "A safety backup was created before restore. You can restore from it if needed.",
             }
         else:
             raise_tool_error(create_error_response(
@@ -631,11 +622,7 @@ def register_backup_tools(mcp: "FastMCP", client: HomeAssistantClient, **kwargs:
            - Modified script? Use ha_config_set_script to fix it
            - Most config changes can be rolled back without using restore
 
-        2. **Safety mechanism:** A NEW backup is automatically created BEFORE restore
-           - This allows you to rollback the restore if needed
-           - You can restore from this pre-restore backup if something goes wrong
-
-        3. **What gets restored:**
+        2. **What gets restored:**
            - Home Assistant configuration (automations, scripts, etc.)
            - Add-ons (if they were in the backup)
            - Optional: Database - historical sensor data, statistics, state history (set restore_database=true)
